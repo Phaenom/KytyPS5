@@ -26,6 +26,7 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #else
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -501,7 +502,132 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 	SampleThreads(stats, now);
 }
 
+// The DRM card of the selected GPU and its hwmon sensors, found on the first sample.
+struct GpuState {
+	bool                  searched = false;
+	std::filesystem::path device;
+	std::filesystem::path hwmon;
+};
+
+// Reads a decimal or 0x-prefixed sysfs number.
+std::optional<uint64_t> ReadNumber(const std::filesystem::path& path) {
+	std::ifstream file(path);
+	std::string   text;
+	if (!(file >> text)) {
+		return std::nullopt;
+	}
+	char*      end   = nullptr;
+	const auto value = std::strtoull(text.c_str(), &end, 0);
+	return end != text.c_str() && *end == '\0' ? std::optional<uint64_t>(value) : std::nullopt;
+}
+
+std::string ReadLine(const std::filesystem::path& path) {
+	std::ifstream file(path);
+	std::string   line;
+	std::getline(file, line);
+	return line;
+}
+
+void FindGpu(GpuState& state, const GpuIdentity& gpu) {
+	state.searched = true;
+	if (gpu.vendor_id == 0) {
+		return;
+	}
+	std::error_code error;
+	for (std::filesystem::directory_iterator it("/sys/class/drm", error), end; !error && it != end;
+	     it.increment(error)) {
+		// Connectors (card1-DP-1) and render nodes share the directory with the cards.
+		const auto name = it->path().filename().string();
+		if (name.rfind("card", 0) != 0 || name.find('-') != std::string::npos) {
+			continue;
+		}
+		const auto device = it->path() / "device";
+		if (ReadNumber(device / "vendor") != gpu.vendor_id ||
+		    ReadNumber(device / "device") != gpu.device_id) {
+			continue;
+		}
+		state.device = device;
+		std::error_code hwmon_error;
+		if (std::filesystem::directory_iterator hwmon(device / "hwmon", hwmon_error);
+		    !hwmon_error && hwmon != std::filesystem::directory_iterator()) {
+			state.hwmon = hwmon->path();
+		}
+		return;
+	}
+}
+
+// amdgpu reports load and VRAM in sysfs; hwmon gives millidegrees, microwatts and hertz for
+// any driver that registers sensors.
+void SampleGpuDevice(GpuState& state, const GpuIdentity& gpu, HostStats& stats) {
+	if (!state.searched) {
+		FindGpu(state, gpu);
+	}
+	if (state.device.empty()) {
+		return;
+	}
+	if (const auto busy = ReadNumber(state.device / "gpu_busy_percent")) {
+		stats.gpu_percent = std::min(100.0, static_cast<double>(*busy));
+	}
+	stats.gpu_vram_used  = ReadNumber(state.device / "mem_info_vram_used");
+	stats.gpu_vram_total = ReadNumber(state.device / "mem_info_vram_total");
+	if (state.hwmon.empty()) {
+		return;
+	}
+	const auto sensor = [&](const char* kind, int index, const char* item) {
+		return state.hwmon / (kind + std::to_string(index) + item);
+	};
+	for (int index = 1; index <= 4; index++) {
+		const auto input = ReadNumber(sensor("temp", index, "_input"));
+		if (!input) {
+			continue;
+		}
+		const double celsius = static_cast<double>(*input) / 1000.0;
+		const auto   label   = ReadLine(sensor("temp", index, "_label"));
+		if (label == "junction") {
+			stats.gpu_hotspot_temperature = celsius;
+		} else if (label == "mem") {
+			stats.gpu_memory_temperature = celsius;
+		} else if (!stats.gpu_temperature) {
+			stats.gpu_temperature = celsius;
+		}
+	}
+	for (int index = 1; index <= 2; index++) {
+		const auto input = ReadNumber(sensor("freq", index, "_input"));
+		if (!input) {
+			continue;
+		}
+		const auto mhz   = static_cast<uint32_t>(*input / 1000000u);
+		const auto label = ReadLine(sensor("freq", index, "_label"));
+		if (label == "sclk") {
+			stats.gpu_core_clock_mhz = mhz;
+		} else if (label == "mclk") {
+			stats.gpu_memory_clock_mhz = mhz;
+		}
+	}
+	// Newer kernels report power1_input; discrete amdgpu GPUs used power1_average before.
+	auto power = ReadNumber(state.hwmon / "power1_input");
+	if (!power) {
+		power = ReadNumber(state.hwmon / "power1_average");
+	}
+	if (power) {
+		stats.gpu_power = static_cast<double>(*power) / 1e6;
+	}
+	if (const auto cap = ReadNumber(state.hwmon / "power1_cap")) {
+		stats.gpu_power_limit = static_cast<double>(*cap) / 1e6;
+	}
+	if (const auto fan = ReadNumber(state.hwmon / "fan1_input")) {
+		stats.gpu_fan_rpm = static_cast<uint32_t>(*fan);
+	}
+}
+
 #endif
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || defined(__APPLE__)
+// macOS samples IOAccelerator with the platform; Windows has no GPU source yet.
+struct GpuState {};
+
+void SampleGpuDevice(GpuState& /*state*/, const GpuIdentity& /*gpu*/, HostStats& /*stats*/) {}
 #endif
 
 constexpr size_t BUSIEST_THREADS = 6;
@@ -510,12 +636,16 @@ constexpr size_t BUSIEST_THREADS = 6;
 
 struct HostStatsSampler::Impl {
 	PlatformState state;
+	GpuIdentity   gpu;
+	GpuState      gpu_state;
 	Counters      last;
 	uint32_t      logical_cores = std::max(std::thread::hardware_concurrency(), 1u);
 	bool          has_last      = false;
 };
 
-HostStatsSampler::HostStatsSampler(): m_impl(std::make_unique<Impl>()) {}
+HostStatsSampler::HostStatsSampler(GpuIdentity gpu): m_impl(std::make_unique<Impl>()) {
+	m_impl->gpu = gpu;
+}
 
 HostStatsSampler::~HostStatsSampler() = default;
 
@@ -526,6 +656,7 @@ HostStats HostStatsSampler::Sample() {
 	Counters now;
 	now.wall_ns = WallNanoseconds();
 	SamplePlatform(m_impl->state, stats, now);
+	SampleGpuDevice(m_impl->gpu_state, m_impl->gpu, stats);
 
 	const auto& last    = m_impl->last;
 	const auto  elapsed = static_cast<double>(now.wall_ns - last.wall_ns) / 1e9;

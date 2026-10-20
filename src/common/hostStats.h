@@ -54,7 +54,7 @@ struct HostStats {
 	std::optional<double> disk_read_per_s;
 	std::optional<double> disk_write_per_s;
 
-	// GPU, whole device (macOS IOAccelerator).
+	// GPU, whole device (macOS IOAccelerator, Linux DRM sysfs and hwmon).
 	std::string             gpu_model;
 	std::optional<uint32_t> gpu_cores;
 	std::optional<double>   gpu_percent;
@@ -63,13 +63,30 @@ struct HostStats {
 	std::optional<uint64_t> gpu_memory_in_use; // System memory the GPU driver has in use.
 	std::optional<uint64_t> gpu_memory_allocated;
 	std::optional<uint64_t> gpu_recoveries; // GPU resets since boot.
+	std::optional<uint64_t> gpu_vram_used;  // All processes.
+	std::optional<uint64_t> gpu_vram_total;
+	std::optional<double>   gpu_temperature; // Celsius.
+	std::optional<double>   gpu_hotspot_temperature;
+	std::optional<double>   gpu_memory_temperature;
+	std::optional<double>   gpu_power; // Watts.
+	std::optional<double>   gpu_power_limit;
+	std::optional<uint32_t> gpu_core_clock_mhz;
+	std::optional<uint32_t> gpu_memory_clock_mhz;
+	std::optional<uint32_t> gpu_fan_rpm;
+};
+
+// The GPU to report on, by PCI vendor and device ID. Platforms that cannot tell GPUs apart
+// (macOS) ignore it.
+struct GpuIdentity {
+	uint32_t vendor_id = 0;
+	uint32_t device_id = 0;
 };
 
 // May block for a few milliseconds (thread enumeration, OS registry reads), so call it off the
 // render thread. The first sample has no rates.
 class HostStatsSampler final {
 public:
-	HostStatsSampler();
+	explicit HostStatsSampler(GpuIdentity gpu = {});
 	~HostStatsSampler();
 	HostStatsSampler(const HostStatsSampler&)            = delete;
 	HostStatsSampler& operator=(const HostStatsSampler&) = delete;

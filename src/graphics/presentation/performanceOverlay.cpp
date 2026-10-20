@@ -91,6 +91,7 @@ Common::HostStats           g_host_stats;
 uint64_t                    g_host_generation = 0;
 std::condition_variable_any g_sampler_wait;
 std::jthread                g_sampler;
+Common::GpuIdentity         g_sampled_gpu; // Written before the sampler thread starts.
 
 void SetOverlayEnabled(bool enabled) {
 	{
@@ -125,7 +126,7 @@ void SamplerThread(const std::stop_token& stop) {
 		const auto generation = g_generation.load(std::memory_order_acquire);
 		lock.unlock();
 		if (!sampler || generation != sampled_generation) {
-			sampler.emplace();
+			sampler.emplace(g_sampled_gpu);
 			sampled_generation = generation;
 		}
 		auto stats = sampler->Sample();
@@ -142,9 +143,13 @@ void SamplerThread(const std::stop_token& stop) {
 	}
 }
 
-void EnsureSampler() {
+void EnsureSampler(const GraphicContext& graphics) {
 	static std::once_flag once;
-	std::call_once(once, [] { g_sampler = std::jthread(SamplerThread); });
+	std::call_once(once, [&] {
+		const auto& properties = graphics.GetPhysicalDeviceProperties();
+		g_sampled_gpu          = {properties.vendorID, properties.deviceID};
+		g_sampler              = std::jthread(SamplerThread);
+	});
 }
 
 ImU32 FrameTimeColor(double ms) {
@@ -210,6 +215,10 @@ void Row(const char* label, const std::string& value, std::optional<ImU32> color
 	std::vsnprintf(buffer, sizeof(buffer), format, args);
 	va_end(args);
 	return buffer;
+}
+
+std::string Celsius(double value) {
+	return Fmt("%.0f °C", value);
 }
 
 bool BeginSection(const char* title) {
@@ -379,7 +388,9 @@ void DrawCompact(const Snapshot& shown) {
 	Row("CPU", host.process_cpu_percent
 	               ? Fmt("%.0f%%  of %u threads", *host.process_cpu_percent, host.logical_cores)
 	               : std::string("n/a"));
-	Row("GPU", Percent(host.gpu_percent));
+	Row("GPU", host.gpu_temperature
+	               ? Percent(host.gpu_percent) + "  " + Celsius(*host.gpu_temperature)
+	               : Percent(host.gpu_percent));
 	GpuActivityRows(shown);
 	CompilationRows(shown);
 	if (shown.device_memory) {
@@ -465,6 +476,34 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		                  : host.gpu_model);
 		Row("Utilization", Percent(host.gpu_percent),
 		    host.gpu_percent ? std::optional(LevelColor(*host.gpu_percent, 80, 95)) : std::nullopt);
+		if (host.gpu_temperature || host.gpu_hotspot_temperature) {
+			auto temperature =
+			    host.gpu_temperature ? Celsius(*host.gpu_temperature) : std::string("n/a");
+			if (host.gpu_hotspot_temperature) {
+				temperature += "  hotspot " + Celsius(*host.gpu_hotspot_temperature);
+			}
+			if (host.gpu_memory_temperature) {
+				temperature += "  memory " + Celsius(*host.gpu_memory_temperature);
+			}
+			Row("Temperature", temperature,
+			    LevelColor(host.gpu_hotspot_temperature.value_or(host.gpu_temperature.value_or(0.0)),
+			               90, 100));
+		}
+		if (host.gpu_core_clock_mhz || host.gpu_memory_clock_mhz) {
+			const auto mhz = [](std::optional<uint32_t> value) {
+				return value ? Fmt("%u MHz", *value) : std::string("n/a");
+			};
+			Row("Clocks", "core " + mhz(host.gpu_core_clock_mhz) + "  memory " +
+			                  mhz(host.gpu_memory_clock_mhz));
+		}
+		if (host.gpu_power) {
+			Row("Power", host.gpu_power_limit
+			                 ? Fmt("%.0f W / %.0f W", *host.gpu_power, *host.gpu_power_limit)
+			                 : Fmt("%.0f W", *host.gpu_power));
+		}
+		if (host.gpu_fan_rpm) {
+			Row("Fan", Fmt("%u RPM", *host.gpu_fan_rpm));
+		}
 		if (host.gpu_renderer_percent || host.gpu_tiler_percent) {
 			Row("Renderer / tiler",
 			    Percent(host.gpu_renderer_percent) + " / " + Percent(host.gpu_tiler_percent));
@@ -490,6 +529,13 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		ImGui::EndTable();
 	}
 	if (BeginSection("GPU memory")) {
+		if (host.gpu_vram_used && host.gpu_vram_total && *host.gpu_vram_total != 0) {
+			// The whole device, including other applications.
+			Row("Device VRAM", Bytes(*host.gpu_vram_used) + " / " + Bytes(*host.gpu_vram_total),
+			    LevelColor(static_cast<double>(*host.gpu_vram_used) /
+			                   static_cast<double>(*host.gpu_vram_total) * 100.0,
+			               80, 95));
+		}
 		if (shown.device_memory) {
 			const double share = shown.device_budget != 0
 			                         ? static_cast<double>(*shown.device_memory) /
@@ -638,7 +684,7 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	if (!PerformanceOverlayEnabled()) {
 		return 0.0f;
 	}
-	EnsureSampler();
+	EnsureSampler(graphics);
 
 	static Snapshot shown;
 	static uint64_t shown_generation = 0;
