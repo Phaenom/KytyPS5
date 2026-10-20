@@ -5163,6 +5163,85 @@ void TestDenseBufferTracking() {
              "resource tracking allowed a second mutation pass");
 }
 
+void TestBufferWriteWindows() {
+  Fixture fixture;
+  const auto buffer = [&](uint32_t first) {
+    return fixture.Buffer({fixture.UserData(first), fixture.UserData(first + 1),
+                           fixture.UserData(first + 2), fixture.UserData(first + 3)});
+  };
+  const auto records = buffer(0);
+  const auto lane_offset = buffer(4);
+  const auto formatted = buffer(8);
+  const auto bytes = buffer(12);
+  const auto unwritten = buffer(16);
+
+  MemoryInfo info;
+  info.kind = ResourceKind::Buffer;
+  const auto emit = [&](ValueOpcode op, Value resource, MemoryInfo memory,
+                        Value offset, Value soffset) {
+    const auto flags = fixture.AddMemory(memory, 4);
+    if (BufferAccessOf(op) == BufferAccess::Read) {
+      fixture.Emit(op, {resource, Value(1u), offset, soffset, Value(true)}, flags);
+    } else {
+      fixture.Emit(op, {resource, Value(1u), offset, soffset, Value(0u), Value(true)},
+                   flags);
+    }
+  };
+  // A counter load at offset 0 beside per-record atomics and stores: only the writes count.
+  emit(ValueOpcode::LoadBufferU32, records, info, Value(0u), Value(0u));
+  auto atomic = info;
+  atomic.offset = 24;
+  emit(ValueOpcode::BufferAtomicIAdd32, records, atomic, Value(0u), Value(0u));
+  auto pair = info;
+  pair.offset = 32;
+  pair.data_dwords = 2;
+  emit(ValueOpcode::StoreBufferU32x2, records, pair, Value(4u), Value(4u));
+  emit(ValueOpcode::StoreBufferU32, lane_offset, info, fixture.UserData(20), Value(0u));
+  auto format = info;
+  format.offset = 8;
+  format.formatted = true;
+  emit(ValueOpcode::StoreBufferU32, formatted, format, Value(0u), Value(0u));
+  auto byte = info;
+  byte.offset = 5;
+  byte.data_bits = 8;
+  emit(ValueOpcode::StoreBufferU8, bytes, byte, Value(0u), Value(0u));
+  emit(ValueOpcode::LoadBufferU32, unwritten, info, Value(0u), Value(0u));
+  fixture.PlanAndTrack();
+
+  const auto &buffers = fixture.program.info.buffers;
+  Check(buffers.size() == 5, "write window buffers were not tracked separately");
+  Check(buffers[0].written && buffers[0].write_begin == 24 && buffers[0].write_end == 48,
+        "constant record writes did not merge into their byte window");
+  Check(buffers[1].write_begin == 0 && buffers[1].write_end == UINT32_MAX,
+        "a lane-varying write offset kept a bounded window");
+  Check(buffers[2].write_begin == 0 && buffers[2].write_end == UINT32_MAX,
+        "a formatted write kept a bounded window");
+  Check(buffers[3].write_begin == 4 && buffers[3].write_end == 8,
+        "a byte write was not widened to its dword");
+  Check(!buffers[4].written && buffers[4].write_end == UINT32_MAX,
+        "a read-only buffer gained a write window");
+
+  // 64-byte records with writes at [24, 48): the counter dword at offset 0 stays clean.
+  auto record = buffers[0];
+  record.packed_stride = 64;
+  Check(!record.MayWrite(0, 4) && !record.MayWrite(64, 68) && !record.MayWrite(48, 88),
+        "reads outside every record window were reported as written");
+  Check(record.MayWrite(20, 28) && record.MayWrite(44, 48) && record.MayWrite(64 * 9 + 47, 64 * 9 + 49),
+        "reads inside a record window were not reported as written");
+  Check(record.MayWrite(0, 64), "a read spanning a whole record missed its window");
+  // A 48-byte stride wraps in 32 bits onto 16-byte multiples, so every residue can be hit.
+  record.packed_stride = 48;
+  Check(record.MayWrite(0, 4), "a wrapping stride kept a sparse window");
+  record.packed_stride = 64 | (1u << 14u);
+  Check(record.MayWrite(0, 4), "a swizzled layout kept a record window");
+  record.packed_stride = 0;
+  Check(!record.MayWrite(0, 24) && !record.MayWrite(48, 52) && record.MayWrite(40, 52),
+        "a zero stride did not test the window directly");
+  record.packed_stride = 64;
+  record.indirect_root = 0;
+  Check(record.MayWrite(0, 4), "a GPU-selected buffer kept a record window");
+}
+
 void TestScalarAndVectorBufferAlias() {
   Fixture fixture;
   const auto d0 = fixture.UserData(0);
@@ -8779,6 +8858,7 @@ int main() {
       }
     };
     Run("dense buffers", TestDenseBufferTracking);
+    Run("buffer write windows", TestBufferWriteWindows);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);

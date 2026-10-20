@@ -131,11 +131,31 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-uint32_t ByteExtent(const MemoryInfo& memory) {
+uint64_t ByteWidth(const MemoryInfo& memory) {
 	const auto bytes = std::max((memory.data_bits + 7u) / 8u, 1u);
 	const auto count = std::max(memory.data_dwords, 1u);
-	const auto end   = static_cast<uint64_t>(memory.offset) + static_cast<uint64_t>(bytes) * count;
+	return static_cast<uint64_t>(bytes) * count;
+}
+
+uint32_t ByteExtent(const MemoryInfo& memory) {
+	const auto end = static_cast<uint64_t>(memory.offset) + ByteWidth(memory);
 	return end > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(end);
+}
+
+// Bytes a buffer write touches relative to index * stride: the immediate, VGPR and SGPR
+// offsets must all be constants, and formatted stores size their elements by the descriptor.
+std::pair<uint32_t, uint32_t> WriteWindow(const Inst& inst, const MemoryInfo& memory) {
+	constexpr std::pair<uint32_t, uint32_t> Any {0u, UINT32_MAX};
+	if (memory.formatted || inst.NumArgs() < 4) return Any;
+	uint64_t begin = memory.offset;
+	for (const size_t arg: {size_t {2}, size_t {3}}) {
+		const auto offset = inst.Arg(arg).Resolve();
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return Any;
+		begin += offset.U32();
+	}
+	const auto end = (begin + ByteWidth(memory) + 3u) & ~uint64_t {3};
+	if (end >= UINT32_MAX) return Any;
+	return {static_cast<uint32_t>(begin & ~uint64_t {3}), static_cast<uint32_t>(end)};
 }
 
 // Prove a loop cannot continue after its bound fails, both on entry and after an
@@ -3749,10 +3769,10 @@ private:
 		}
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddBuffer(uint32_t source, const Inst& inst, const MemoryInfo& memory, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
-				Merge(m_info.buffers[i], memory, op, pc);
+				Merge(m_info.buffers[i], inst, memory, pc);
 				return i;
 			}
 		}
@@ -3762,18 +3782,24 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
-		Merge(resource, memory, op, pc);
+		Merge(resource, inst, memory, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
-	static void Merge(BufferResource& resource, const MemoryInfo& memory, ValueOpcode op,
+	static void Merge(BufferResource& resource, const Inst& inst, const MemoryInfo& memory,
 	                  uint32_t pc) {
+		const auto op            = inst.GetOpcode();
 		const auto access        = BufferAccessOf(op);
 		const bool atomic        = access == BufferAccess::Atomic;
 		const bool write         = access == BufferAccess::Write || atomic;
 		resource.first_use_pc    = std::min(resource.first_use_pc, pc);
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
+		if (write) {
+			const auto [begin, end] = WriteWindow(inst, memory);
+			resource.write_begin = resource.written ? std::min(resource.write_begin, begin) : begin;
+			resource.write_end   = resource.written ? std::max(resource.write_end, end) : end;
+		}
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
 		resource.atomic          = resource.atomic || atomic;
@@ -3945,7 +3971,7 @@ private:
 				m_info.uses_dma                         = true;
 				return;
 			}
-			resource = AddBuffer(source, memory, op, flags.pc);
+			resource = AddBuffer(source, inst, memory, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
 			}

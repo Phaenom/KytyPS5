@@ -941,8 +941,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
+					if (written.size != 0 &&
+					    ImageRangeOverlaps(address, size, written.address, written.size) &&
+					    resource.MayWrite(std::max(address, written.address) - written.address,
+					                      address + size - written.address)) {
 						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}

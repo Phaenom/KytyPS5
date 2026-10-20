@@ -125,6 +125,10 @@ struct BufferResource {
 	uint32_t               descriptor_index   = UINT32_MAX;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
+	// Dword-aligned bytes every write may touch relative to index * stride, before swizzling.
+	// The default covers any byte, as do lane-varying, scalar-register or formatted writes.
+	uint32_t               write_begin        = 0;
+	uint32_t               write_end          = UINT32_MAX;
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
@@ -139,6 +143,30 @@ struct BufferResource {
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+
+	// Whether a write may touch bytes [begin, end) past the descriptor base. Host writes land at
+	// 32-bit index * stride + window offsets; even when that wraps, each keeps its window residue
+	// modulo the stride's largest power-of-two factor. Swizzled and GPU-selected layouts may
+	// touch any byte.
+	[[nodiscard]] bool MayWrite(uint64_t begin, uint64_t end) const {
+		const uint32_t stride = packed_stride & 0x3fffu;
+		if (write_end == UINT32_MAX || (stride != 0u && (packed_stride & (1u << 14u)) != 0u) ||
+		    indirect_root != NoIndirectBuffer || !indirect_resources.empty()) {
+			return true;
+		}
+		if (stride == 0u) {
+			return begin < write_end && write_begin < end;
+		}
+		const uint64_t period     = stride & (0u - stride);
+		const uint64_t write_size = write_end - write_begin;
+		const uint64_t read_size  = end - begin;
+		if (write_size >= period || read_size >= period) {
+			return true;
+		}
+		// Both arcs are shorter than the period: the read starts inside the write, or wraps into it.
+		const auto distance = (begin + period - write_begin % period) % period;
+		return distance < write_size || distance + read_size > period;
+	}
 
 	bool operator==(const BufferResource& other) const = default;
 };
