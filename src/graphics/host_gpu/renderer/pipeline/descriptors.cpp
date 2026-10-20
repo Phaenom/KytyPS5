@@ -915,36 +915,58 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
-	for (const auto* reader: prepared_bindings) {
-		const auto& reads = reader->runtime->resources->specialization_reads;
-		if (reads.empty()) continue;
+	const bool has_specialization_reads =
+	    std::ranges::any_of(prepared_bindings, [](const PreparedBindings* prepared) {
+		    return !prepared->runtime->resources->specialization_reads.empty();
+	    });
+	if (has_specialization_reads) {
 		for (const auto* writer: prepared_bindings) {
 			if (writer->runtime->program->has_address_writes) {
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		for (const auto [address, size]: reads) {
-			for (const auto id: m_bound_images) {
-				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
-				if (image == nullptr ||
-				    (!image->binding.shader_write && !image->binding.is_target)) continue;
-				for (const auto written: {image->info.data, image->info.stencil,
-				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
-					}
+		// Reads are captured per dword, so gather the stages' writes once instead of per read.
+		const auto valid = [](uint64_t address, uint64_t size) {
+			return size != 0 && address <= UINT64_MAX - size;
+		};
+		m_written_ranges.clear();
+		for (const auto id: m_bound_images) {
+			const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+			if (image == nullptr ||
+			    (!image->binding.shader_write && !image->binding.is_target)) continue;
+			for (const auto written: {image->info.data, image->info.stencil,
+			                          image->info.metadata.range}) {
+				if (written.size != 0) m_written_ranges.push_back({written.address, written.size});
+			}
+		}
+		for (const auto* writer: prepared_bindings) {
+			for (const auto& resource: writer->runtime->program->info.buffers) {
+				if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+				const auto& written = writer->buffer_sources[resource.descriptor_index];
+				if (written.size != 0) {
+					m_written_ranges.push_back({written.address, written.size, &resource});
 				}
 			}
-			for (const auto* writer: prepared_bindings) {
-				const auto& program = *writer->runtime->program;
-				for (const auto& resource: program.info.buffers) {
-					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
-					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 &&
-					    ImageRangeOverlaps(address, size, written.address, written.size) &&
-					    resource.MayWrite(std::max(address, written.address) - written.address,
-					                      address + size - written.address)) {
+		}
+		if (!std::ranges::all_of(m_written_ranges, [&](const WrittenRange& written) {
+			    return valid(written.address, written.size);
+		    })) {
+			EXIT("invalid image overlap range\n");
+		}
+		for (const auto* reader: prepared_bindings) {
+			if (m_written_ranges.empty()) break;
+			for (const auto [address, size]: reader->runtime->resources->specialization_reads) {
+				if (!valid(address, size)) {
+					EXIT("invalid image overlap range\n");
+				}
+				for (const auto& written: m_written_ranges) {
+					if (address >= written.address + written.size ||
+					    written.address >= address + size) continue;
+					if (written.buffer == nullptr) {
+						EXIT("scalar resource reads overlap an image or attachment write\n");
+					}
+					if (written.buffer->MayWrite(std::max(address, written.address) - written.address,
+					                             address + size - written.address)) {
 						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}

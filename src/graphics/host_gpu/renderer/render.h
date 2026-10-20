@@ -171,6 +171,13 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	// A guest range the committed stages may write. Image and attachment writes have no buffer.
+	struct WrittenRange {
+		uint64_t                                    address = 0;
+		uint64_t                                    size    = 0;
+		const ShaderRecompiler::IR::BufferResource* buffer  = nullptr;
+	};
+
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
@@ -213,6 +220,7 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::vector<WrittenRange>             m_written_ranges;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
