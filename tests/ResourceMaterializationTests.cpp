@@ -584,6 +584,16 @@ void TestResourceMemoRevalidatesInputs() {
         "memo keyed on unread user data registers");
   Check(!user_memo.Materialize(user_plan, {}, snapshot, specialization),
         "memo accepted missing user data");
+  ResourceMemo many;
+  for (uint32_t pass = 0; pass < 2; ++pass) {
+    for (uint32_t value = 0; value < 100; ++value) {
+      user_data = {0x1000u + value * 0x10u, pass};
+      Check(many.Materialize(user_plan, {.user_data = user_data}, snapshot, specialization) &&
+                snapshot.buffers[0].dwords[0] == user_data[0],
+            "memoized refresh returned another entry's descriptor");
+    }
+  }
+  Check(many.Hits() == 100 && many.Misses() == 100, "memo dropped entries it had room for");
 
   // A native walker is cheap already; the memo leaves it alone.
   std::array<uint32_t, 1> table{};

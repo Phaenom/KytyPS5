@@ -1818,8 +1818,32 @@ private:
 	Entry&     m_entry;
 };
 
+uint64_t ResourceMemo::KeyHash(std::span<const uint32_t> user_data, uint64_t mask,
+                               uint64_t shader_base, uint64_t indirect_args_address,
+                               std::span<const uint32_t> workgroup_counts) {
+	uint64_t   hash = user_data.size();
+	const auto mix  = [&hash](uint64_t value) {
+		hash = (hash ^ value) * 0x9e3779b97f4a7c15ull;
+		hash ^= hash >> 29u;
+	};
+	mix(shader_base);
+	mix(indirect_args_address);
+	for (const auto count: workgroup_counts)
+		mix(count);
+	if (mask == ~uint64_t {0}) {
+		for (const auto value: user_data)
+			mix(value);
+		return hash;
+	}
+	for (auto bits = mask; bits != 0u; bits &= bits - 1u) {
+		const auto index = static_cast<size_t>(std::countr_zero(bits));
+		if (index < user_data.size()) mix(user_data[index]);
+	}
+	return hash;
+}
+
 bool ResourceMemo::InputsMatch(const Entry& entry, const SrtRuntime& runtime) {
-	if (!entry.valid || entry.user_data_size != runtime.user_data.size() ||
+	if (!entry.valid || entry.user_data.size() != runtime.user_data.size() ||
 	    entry.shader_base != runtime.shader_base ||
 	    entry.indirect_args_address != runtime.indirect_args_address ||
 	    !std::ranges::equal(entry.workgroup_counts, runtime.workgroup_counts)) {
@@ -1828,9 +1852,9 @@ bool ResourceMemo::InputsMatch(const Entry& entry, const SrtRuntime& runtime) {
 	if (entry.user_data_mask == ~uint64_t {0}) {
 		return std::ranges::equal(entry.user_data, runtime.user_data);
 	}
-	auto stored = entry.user_data.begin();
 	for (auto bits = entry.user_data_mask; bits != 0u; bits &= bits - 1u) {
-		if (runtime.user_data[std::countr_zero(bits)] != *stored++) return false;
+		const auto index = std::countr_zero(bits);
+		if (runtime.user_data[index] != entry.user_data[index]) return false;
 	}
 	return true;
 }
@@ -1862,10 +1886,12 @@ bool ResourceMemo::Materialize(const ResourcePlan& program, const SrtRuntime& ru
 	if (native || !program.source_reads.empty() || runtime.user_data_reads != nullptr) {
 		return MaterializeResources(program, runtime, snapshot, specialization);
 	}
-	Entry* slot = nullptr;
-	for (auto& entry: m_entries) {
-		if (!InputsMatch(entry, runtime)) continue;
-		if (ReadsMatch(entry, runtime)) {
+	Entry*     slot = nullptr;
+	const auto hash = KeyHash(runtime.user_data, m_key_mask, runtime.shader_base,
+	                          runtime.indirect_args_address, runtime.workgroup_counts);
+	if (const auto found = m_index.find(hash); found != m_index.end()) {
+		auto& entry = m_entries[found->second];
+		if (InputsMatch(entry, runtime) && ReadsMatch(entry, runtime)) {
 			++m_hits;
 			snapshot       = entry.snapshot;
 			specialization = entry.specialization;
@@ -1873,7 +1899,6 @@ bool ResourceMemo::Materialize(const ResourcePlan& program, const SrtRuntime& ru
 			return true;
 		}
 		slot = &entry;
-		break;
 	}
 	++m_misses;
 	if (slot == nullptr && m_entries.size() < Capacity) {
@@ -1881,6 +1906,10 @@ bool ResourceMemo::Materialize(const ResourcePlan& program, const SrtRuntime& ru
 	} else if (slot == nullptr) {
 		slot   = &m_entries[m_next];
 		m_next = (m_next + 1u) % Capacity;
+		if (const auto indexed = m_index.find(slot->key_hash);
+		    slot->valid && indexed != m_index.end() && &m_entries[indexed->second] == slot) {
+			m_index.erase(indexed);
+		}
 	}
 	slot->valid          = false;
 	slot->user_data_mask = 0;
@@ -1890,27 +1919,39 @@ bool ResourceMemo::Materialize(const ResourcePlan& program, const SrtRuntime& ru
 	if (!MaterializeResources(program, recorder.Runtime(), snapshot, specialization)) {
 		return false;
 	}
-	slot->user_data_size = runtime.user_data.size();
-	slot->user_data.clear();
-	if (slot->user_data_mask == ~uint64_t {0}) {
-		slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	} else {
-		for (auto bits = slot->user_data_mask; bits != 0u; bits &= bits - 1u) {
-			slot->user_data.push_back(runtime.user_data[std::countr_zero(bits)]);
-		}
-	}
+	slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	slot->shader_base           = runtime.shader_base;
 	slot->indirect_args_address = runtime.indirect_args_address;
 	slot->workgroup_counts.assign(runtime.workgroup_counts.begin(), runtime.workgroup_counts.end());
 	slot->snapshot       = snapshot;
 	slot->specialization = specialization;
 	slot->valid          = true;
+	const auto index     = static_cast<uint32_t>(slot - m_entries.data());
+	if ((m_key_mask | slot->user_data_mask) == m_key_mask) {
+		Index(index);
+		return true;
+	}
+	m_key_mask |= slot->user_data_mask;
+	m_index.clear();
+	for (uint32_t other = 0; other < m_entries.size(); ++other) {
+		if (other != index && m_entries[other].valid) Index(other);
+	}
+	Index(index);
 	return true;
+}
+
+void ResourceMemo::Index(uint32_t slot) {
+	auto& entry             = m_entries[slot];
+	entry.key_hash          = KeyHash(entry.user_data, m_key_mask, entry.shader_base,
+	                                  entry.indirect_args_address, entry.workgroup_counts);
+	m_index[entry.key_hash] = slot;
 }
 
 void ResourceMemo::Clear() {
 	m_entries.clear();
-	m_next = 0;
+	m_index.clear();
+	m_key_mask = 0;
+	m_next     = 0;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

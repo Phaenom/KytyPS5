@@ -80,8 +80,8 @@ private:
 	};
 	struct Entry {
 		bool                   valid          = false;
+		uint64_t               key_hash       = 0;
 		uint64_t               user_data_mask = 0;
-		size_t                 user_data_size = 0;
 		std::vector<uint32_t>  user_data;
 		uint64_t               shader_base           = 0;
 		uint64_t               indirect_args_address = 0;
@@ -93,16 +93,24 @@ private:
 	};
 	class Recorder;
 
-	static constexpr size_t Capacity = 32;
+	static constexpr size_t Capacity = 256;
 
-	[[nodiscard]] static bool InputsMatch(const Entry& entry, const SrtRuntime& runtime);
-	bool                      ReadsMatch(const Entry& entry, const SrtRuntime& runtime);
+	[[nodiscard]] static uint64_t KeyHash(std::span<const uint32_t> user_data, uint64_t mask,
+	                                      uint64_t shader_base, uint64_t indirect_args_address,
+	                                      std::span<const uint32_t> workgroup_counts);
+	[[nodiscard]] static bool     InputsMatch(const Entry& entry, const SrtRuntime& runtime);
+	bool                          ReadsMatch(const Entry& entry, const SrtRuntime& runtime);
+	void                          Index(uint32_t slot);
 
-	std::vector<Entry>    m_entries;
-	size_t                m_next   = 0;
-	uint64_t              m_hits   = 0;
-	uint64_t              m_misses = 0;
-	std::vector<uint32_t> m_scratch;
+	// Entries are found by a hash of the user data registers any entry read, so a register only
+	// some evaluations read can split entries that would match, but never merges two that differ.
+	std::vector<Entry>                     m_entries;
+	std::unordered_map<uint64_t, uint32_t> m_index;
+	uint64_t                               m_key_mask = 0;
+	size_t                                 m_next     = 0;
+	uint64_t                               m_hits     = 0;
+	uint64_t                               m_misses   = 0;
+	std::vector<uint32_t>                  m_scratch;
 };
 
 // Applies an already-derived specialization to native IR before layout and emission.
