@@ -140,6 +140,11 @@ in menus, on a Ryzen 9 7950X with an RX 7900 XTX (RADV).
   - about 55% are `GuestGpu::SendCommandSync` read requests from other threads;
   - about 41% are faults while `MaterializeResources`/`SrtWalker` read GPU-written memory;
   - about 2% are indirect-draw arguments.
+- Frame time is the GPU thread's CPU time plus its blocking waits, run one after the other
+  (about 109 + 58 ms). Fewer waits alone do not help: the rest still wait for all queued GPU work.
+  Reading GPU-protected SRT pages without a readback (local branch `wip/srt-protected-reads`)
+  cut waits from 341 to 262 per frame but cost 9 ms more CPU, 6.0 to 5.8 FPS. The CPU time per
+  draw (SRT evaluation, texture-cache lookups) has to come down first.
 - Measuring:
   - FPS: count `Libs::VideoOut::FlipQueue::Reserve` calls with
     `perf stat -e mem:<addr>:x -p <pid>`.
