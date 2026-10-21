@@ -136,6 +136,8 @@ in menus, on a Ryzen 9 7950X with an RX 7900 XTX (RADV).
   - `CommitBindings` gathers written ranges once.
   - Together these took the thread from 108 to 76 ms per frame, 6.4 to 8.3 FPS.
   - Linux GPU stats in the overlay.
+  - `IR::ResourceMemo` reuses interpreted `MaterializeResources` results whose user data
+    registers and guest reads are unchanged: 69% of interpreted calls reused, 109 to 103 ms.
 - Next: about 300 blocking GPU waits per frame, all `BufferCache::DownloadBufferMemory`:
   - about 55% are `GuestGpu::SendCommandSync` read requests from other threads;
   - about 41% are faults while `MaterializeResources`/`SrtWalker` read GPU-written memory;
@@ -145,6 +147,10 @@ in menus, on a Ryzen 9 7950X with an RX 7900 XTX (RADV).
   Reading GPU-protected SRT pages without a readback (local branch `wip/srt-protected-reads`)
   cut waits from 341 to 262 per frame but cost 9 ms more CPU, 6.0 to 5.8 FPS. The CPU time per
   draw (SRT evaluation, texture-cache lookups) has to come down first.
+- A frame makes about 14,000 `ProgramCache::Get` calls. 63% of them refresh through the SRT JIT
+  and bypass the memo. `CommandProcessor::DrawIndirectMulti` runs the full draw path once per
+  sub-draw (shader lookup, bindings, pipeline, render targets) and takes about half of the
+  thread's CPU time. Sharing that work across the sub-draws is the next large lever.
 - Measuring:
   - FPS: count `Libs::VideoOut::FlipQueue::Reserve` calls with
     `perf stat -e mem:<addr>:x -p <pid>`.
