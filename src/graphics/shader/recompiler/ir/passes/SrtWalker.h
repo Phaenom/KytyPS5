@@ -20,6 +20,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
+	// The interpreter sets bit i when it reads user_data[i]; an index past 63 sets every bit.
+	uint64_t* user_data_reads = nullptr;
 };
 
 class SrtReadCapture {

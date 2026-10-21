@@ -10,6 +10,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -1534,6 +1535,20 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+namespace {
+
+bool UsesWorkgroupCount(const DescriptorSource& source) {
+	return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
+}
+
+bool CapturesReads(const ResourcePlan& program, const SrtRuntime& runtime) {
+	return program.capture_specialization_reads || !program.source_reads.empty() ||
+	       (runtime.indirect_args_address != 0u &&
+	        std::ranges::any_of(program.descriptor_sources, UsesWorkgroupCount));
+}
+
+} // namespace
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
@@ -1542,12 +1557,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     runtime.read_specialization_memory == nullptr)) {
 		return false;
 	}
-	const auto uses_workgroup_count = [](const DescriptorSource& source) {
-		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
-	};
-	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty() ||
-	    (runtime.indirect_args_address != 0u &&
-	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
+	const bool capture_reads = CapturesReads(program, runtime);
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
 	SrtReadCapture capture {runtime, reads};
@@ -1564,7 +1574,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (runtime.indirect_args_address != 0u) {
 		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
 			if ((!active.empty() && !active[source]) ||
-			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
+			    !UsesWorkgroupCount(program.descriptor_sources[source]))
+				continue;
 			if ((runtime.indirect_args_address & 3u) != 0u ||
 			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
 			               observed, workgroup_counts)) return false;
@@ -1742,6 +1753,164 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+// Logs every guest read of one interpreted materialization, in order. A strict read that
+// continues the previous one is merged into it: replaying it costs one reader call, and a strict
+// reader fails instead of faulting if the merged range is no longer readable.
+class ResourceMemo::Recorder {
+public:
+	Recorder(const SrtRuntime& inner, Entry& entry): m_inner(inner), m_entry(entry) {}
+
+	[[nodiscard]] SrtRuntime Runtime() {
+		auto runtime        = m_inner;
+		runtime.userdata    = this;
+		runtime.read_memory = Ordinary;
+		runtime.read_specialization_memory =
+		    m_inner.read_specialization_memory != nullptr ? Strict : nullptr;
+		runtime.user_data_reads = &m_entry.user_data_mask;
+		return runtime;
+	}
+
+private:
+	static bool Ordinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto&       recorder = *static_cast<Recorder*>(userdata);
+		const auto& inner    = recorder.m_inner;
+		bool        ok       = true;
+		if (inner.read_memory != nullptr) {
+			ok = inner.read_memory(inner.userdata, address, values);
+		} else {
+			std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		}
+		recorder.Log(address, values, false, ok);
+		return ok;
+	}
+
+	static bool Strict(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto&       recorder = *static_cast<Recorder*>(userdata);
+		const auto& inner    = recorder.m_inner;
+		const bool  ok       = inner.read_specialization_memory(inner.userdata, address, values);
+		recorder.Log(address, values, true, ok);
+		return ok;
+	}
+
+	void Log(uint64_t address, std::span<const uint32_t> values, bool strict, bool ok) {
+		auto& reads = m_entry.reads;
+		auto& words = m_entry.words;
+		if (strict && ok && !values.empty() && !reads.empty()) {
+			auto& last = reads.back();
+			if (last.strict && last.ok &&
+			    address == last.address + uint64_t {last.count} * sizeof(uint32_t)) {
+				words.insert(words.end(), values.begin(), values.end());
+				last.count += static_cast<uint32_t>(values.size());
+				return;
+			}
+		}
+		reads.push_back({.address = address,
+		                 .first   = static_cast<uint32_t>(words.size()),
+		                 .count   = static_cast<uint32_t>(values.size()),
+		                 .strict  = strict,
+		                 .ok      = ok});
+		if (ok) words.insert(words.end(), values.begin(), values.end());
+	}
+
+	SrtRuntime m_inner;
+	Entry&     m_entry;
+};
+
+bool ResourceMemo::InputsMatch(const Entry& entry, const SrtRuntime& runtime) {
+	if (!entry.valid || entry.user_data_size != runtime.user_data.size() ||
+	    entry.shader_base != runtime.shader_base ||
+	    entry.indirect_args_address != runtime.indirect_args_address ||
+	    !std::ranges::equal(entry.workgroup_counts, runtime.workgroup_counts)) {
+		return false;
+	}
+	if (entry.user_data_mask == ~uint64_t {0}) {
+		return std::ranges::equal(entry.user_data, runtime.user_data);
+	}
+	auto stored = entry.user_data.begin();
+	for (auto bits = entry.user_data_mask; bits != 0u; bits &= bits - 1u) {
+		if (runtime.user_data[std::countr_zero(bits)] != *stored++) return false;
+	}
+	return true;
+}
+
+// Stops at the first difference: until then every read has the address the original evaluation
+// computed, so none of them reaches memory a fresh evaluation would not read.
+bool ResourceMemo::ReadsMatch(const Entry& entry, const SrtRuntime& runtime) {
+	for (const auto& read: entry.reads) {
+		const auto expected = std::span(entry.words).subspan(read.first, read.ok ? read.count : 0u);
+		if (!read.strict && runtime.read_memory == nullptr) {
+			if (std::memcmp(reinterpret_cast<const void*>(read.address), expected.data(),
+			                expected.size_bytes()) != 0) {
+				return false;
+			}
+			continue;
+		}
+		m_scratch.resize(read.count);
+		const auto reader = read.strict ? runtime.read_specialization_memory : runtime.read_memory;
+		const bool ok     = reader(runtime.userdata, read.address, m_scratch);
+		if (ok != read.ok || (ok && !std::ranges::equal(m_scratch, expected))) return false;
+	}
+	return true;
+}
+
+bool ResourceMemo::Materialize(const ResourcePlan& program, const SrtRuntime& runtime,
+                               ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	const bool native = program.srt_code != nullptr && runtime.read_memory == nullptr &&
+	                    !CapturesReads(program, runtime);
+	if (native || !program.source_reads.empty() || runtime.user_data_reads != nullptr) {
+		return MaterializeResources(program, runtime, snapshot, specialization);
+	}
+	Entry* slot = nullptr;
+	for (auto& entry: m_entries) {
+		if (!InputsMatch(entry, runtime)) continue;
+		if (ReadsMatch(entry, runtime)) {
+			++m_hits;
+			snapshot       = entry.snapshot;
+			specialization = entry.specialization;
+			snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+			return true;
+		}
+		slot = &entry;
+		break;
+	}
+	++m_misses;
+	if (slot == nullptr && m_entries.size() < Capacity) {
+		slot = &m_entries.emplace_back();
+	} else if (slot == nullptr) {
+		slot   = &m_entries[m_next];
+		m_next = (m_next + 1u) % Capacity;
+	}
+	slot->valid          = false;
+	slot->user_data_mask = 0;
+	slot->reads.clear();
+	slot->words.clear();
+	Recorder recorder(runtime, *slot);
+	if (!MaterializeResources(program, recorder.Runtime(), snapshot, specialization)) {
+		return false;
+	}
+	slot->user_data_size = runtime.user_data.size();
+	slot->user_data.clear();
+	if (slot->user_data_mask == ~uint64_t {0}) {
+		slot->user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	} else {
+		for (auto bits = slot->user_data_mask; bits != 0u; bits &= bits - 1u) {
+			slot->user_data.push_back(runtime.user_data[std::countr_zero(bits)]);
+		}
+	}
+	slot->shader_base           = runtime.shader_base;
+	slot->indirect_args_address = runtime.indirect_args_address;
+	slot->workgroup_counts.assign(runtime.workgroup_counts.begin(), runtime.workgroup_counts.end());
+	slot->snapshot       = snapshot;
+	slot->specialization = specialization;
+	slot->valid          = true;
+	return true;
+}
+
+void ResourceMemo::Clear() {
+	m_entries.clear();
+	m_next = 0;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

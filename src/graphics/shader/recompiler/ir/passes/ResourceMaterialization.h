@@ -56,6 +56,55 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// MaterializeResources for one plan that reuses earlier interpreted results. An entry matches
+// when the user data registers, shader base and workgroup inputs it read are unchanged and every
+// guest read it made, re-read in the original order, returns the same words. Plans refreshed by
+// the native SRT walker are cheap already and always rematerialize.
+class ResourceMemo {
+public:
+	bool Materialize(const ResourcePlan& program, const SrtRuntime& runtime,
+	                 ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+	// Required whenever the plan changes.
+	void Clear();
+
+	[[nodiscard]] uint64_t Hits() const { return m_hits; }
+	[[nodiscard]] uint64_t Misses() const { return m_misses; }
+
+private:
+	struct Read {
+		uint64_t address = 0;
+		uint32_t first   = 0;
+		uint32_t count   = 0;
+		bool     strict  = false;
+		bool     ok      = false;
+	};
+	struct Entry {
+		bool                   valid          = false;
+		uint64_t               user_data_mask = 0;
+		size_t                 user_data_size = 0;
+		std::vector<uint32_t>  user_data;
+		uint64_t               shader_base           = 0;
+		uint64_t               indirect_args_address = 0;
+		std::vector<uint32_t>  workgroup_counts;
+		std::vector<Read>      reads;
+		std::vector<uint32_t>  words;
+		ResourceSnapshot       snapshot;
+		ResourceSpecialization specialization;
+	};
+	class Recorder;
+
+	static constexpr size_t Capacity = 32;
+
+	[[nodiscard]] static bool InputsMatch(const Entry& entry, const SrtRuntime& runtime);
+	bool                      ReadsMatch(const Entry& entry, const SrtRuntime& runtime);
+
+	std::vector<Entry>    m_entries;
+	size_t                m_next   = 0;
+	uint64_t              m_hits   = 0;
+	uint64_t              m_misses = 0;
+	std::vector<uint32_t> m_scratch;
+};
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 

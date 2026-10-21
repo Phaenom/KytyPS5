@@ -548,6 +548,70 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
+void TestResourceMemoRevalidatesInputs() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+
+  // Ordinary guest reads are compared in place.
+  uint32_t dword = 0;
+  auto plan = ExtractResourcePlan(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
+  Check(plan.srt_code == nullptr, "an immediate SRT address compiled a native walker");
+  ResourceMemo memo;
+  for (const uint32_t value : {0x12345678u, 0x12345678u, 0x0badf00du, 0x0badf00du}) {
+    dword = value;
+    Check(memo.Materialize(plan, {}, snapshot, specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{value},
+          "memoized SRT refresh returned a stale guest word");
+  }
+  Check(memo.Hits() == 2 && memo.Misses() == 2, "memo did not reuse unchanged guest words");
+
+  // Only the user data registers the evaluation read select an entry.
+  auto user_plan = UserDataBufferPlan();
+  ResourceMemo user_memo;
+  std::array<uint32_t, 2> user_data{};
+  const auto refresh = [&](uint32_t first, uint32_t second) {
+    user_data = {first, second};
+    return user_memo.Materialize(user_plan, {.user_data = user_data}, snapshot,
+                                 specialization) &&
+           snapshot.buffers.size() == 1 && snapshot.buffers[0].dwords[0] == first &&
+           snapshot.user_data == std::vector<uint32_t>{first, second};
+  };
+  Check(refresh(0x1000u, 7u) && refresh(0x1000u, 8u) && refresh(0x2000u, 8u) &&
+            refresh(0x1000u, 9u),
+        "memoized user data refresh returned stale descriptors or user data");
+  Check(user_memo.Hits() == 2 && user_memo.Misses() == 2,
+        "memo keyed on unread user data registers");
+  Check(!user_memo.Materialize(user_plan, {}, snapshot, specialization),
+        "memo accepted missing user data");
+
+  // A native walker is cheap already; the memo leaves it alone.
+  std::array<uint32_t, 1> table{};
+  auto native = SrtProgram(0u);
+  auto &block = *native.blocks[0];
+  native.user_data_count = 2;
+  auto *handle = native.srt_reads[0].value.Instruction()->Arg(0).Instruction();
+  handle->SetArg(0, Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                               {Value(ScalarReg(0))})));
+  handle->SetArg(1, Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                               {Value(ScalarReg(1))})));
+  auto native_plan = ExtractResourcePlan(native);
+  Check(native_plan.srt_code != nullptr, "a user data SRT did not compile a native walker");
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  const std::array<uint32_t, 2> pointer{static_cast<uint32_t>(address),
+                                        static_cast<uint32_t>(address >> 32u)};
+  ResourceMemo native_memo;
+  for (const uint32_t value : {0x11111111u, 0x22222222u}) {
+    table[0] = value;
+    Check(native_memo.Materialize(native_plan, {.user_data = pointer}, snapshot,
+                                  specialization) &&
+              snapshot.flattened_srt == std::vector<uint32_t>{value},
+          "native SRT refresh through the memo returned a stale word");
+  }
+  Check(native_memo.Hits() == 0 && native_memo.Misses() == 0,
+        "memo interpreted a native SRT plan");
+}
+
 void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -595,7 +659,12 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   auto plan = ExtractResourcePlan(program);
   Check(plan.capture_specialization_reads == memory_condition && !plan.control_flow.empty(),
         "conditional writable descriptor used the wrong memory dependency policy");
-  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
+  struct Reads {
+    uint32_t ordinary = 0;
+    uint32_t strict = 0;
+    bool clean = false;
+    uint32_t word = 0x8000u;
+  } reads;
   const std::array<uint32_t, 1> user_data{4u};
   const SrtRuntime runtime{
       .user_data = user_data,
@@ -609,7 +678,7 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
         auto &reads = *static_cast<Reads *>(data);
         ++reads.strict;
         if (!reads.clean || address != 0x1004u) return false;
-        words[0] = 0x8000u;
+        words[0] = reads.word;
         return true;
       }};
   ResourceSnapshot snapshot;
@@ -629,6 +698,23 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
                   : std::vector<std::pair<uint64_t, uint64_t>>{}),
           "writable descriptor lost its address or captured an immutable predicate");
   }
+  if (!memory_condition) return;
+  // The memo replays the strict predicate read and reuses a result only while it is unchanged.
+  ResourceMemo memo;
+  ResourceSnapshot fresh;
+  ResourceSpecialization fresh_specialization;
+  for (const uint32_t word : {0x8000u, 0x8000u, 0x9000u}) {
+    reads = {.clean = true, .word = word};
+    Check(memo.Materialize(plan, runtime, snapshot, specialization) &&
+              MaterializeResources(plan, runtime, fresh, fresh_specialization),
+          "memoized writable descriptor refresh failed");
+    Check(snapshot.buffers == fresh.buffers && snapshot.flattened_srt == fresh.flattened_srt &&
+              snapshot.specialization_reads == fresh.specialization_reads &&
+              specialization == fresh_specialization,
+          "memoized writable descriptor differs from a fresh refresh");
+  }
+  Check(memo.Hits() == 1 && memo.Misses() == 2,
+        "memo did not revalidate its strict predicate read");
 }
 
 void TestFailedMaterializationRejectsStage() {
@@ -1360,6 +1446,7 @@ int main() {
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
+  TestResourceMemoRevalidatesInputs();
   for (const bool memory_condition : {false, true})
     TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
