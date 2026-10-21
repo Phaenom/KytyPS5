@@ -137,7 +137,8 @@ in menus, on a Ryzen 9 7950X with an RX 7900 XTX (RADV).
   - Together these took the thread from 108 to 76 ms per frame, 6.4 to 8.3 FPS.
   - Linux GPU stats in the overlay.
   - `IR::ResourceMemo` reuses interpreted `MaterializeResources` results whose user data
-    registers and guest reads are unchanged: 69% of interpreted calls reused, 109 to 103 ms.
+    registers and guest reads are unchanged: 74% of interpreted calls reused, 109 to about
+    104 ms. The other misses are new register values and changed guest words, about half each.
 - Next: about 300 blocking GPU waits per frame, all `BufferCache::DownloadBufferMemory`:
   - about 55% are `GuestGpu::SendCommandSync` read requests from other threads;
   - about 41% are faults while `MaterializeResources`/`SrtWalker` read GPU-written memory;
@@ -147,10 +148,12 @@ in menus, on a Ryzen 9 7950X with an RX 7900 XTX (RADV).
   Reading GPU-protected SRT pages without a readback (local branch `wip/srt-protected-reads`)
   cut waits from 341 to 262 per frame but cost 9 ms more CPU, 6.0 to 5.8 FPS. The CPU time per
   draw (SRT evaluation, texture-cache lookups) has to come down first.
-- A frame makes about 14,000 `ProgramCache::Get` calls. 63% of them refresh through the SRT JIT
-  and bypass the memo. `CommandProcessor::DrawIndirectMulti` runs the full draw path once per
-  sub-draw (shader lookup, bindings, pipeline, render targets) and takes about half of the
-  thread's CPU time. Sharing that work across the sub-draws is the next large lever.
+- A frame has about 6,400 draws (mostly `DRAW_INDIRECT` packets of one draw each), 2,500 direct and
+  250 indirect dispatches: about 11 us of GPU-thread CPU per command; 60 FPS needs under 2 us.
+- About 15,000 `ProgramCache::Get` calls per frame; 63% refresh through the SRT JIT and bypass
+  the memo (about 4% of CPU). The roughly 1,400 memo misses per frame cost about 25% of CPU in
+  the interpreter (16 us each, about 50 us for indirect dispatches whose descriptor count comes
+  from GPU-written arguments).
 - Measuring:
   - FPS: count `Libs::VideoOut::FlipQueue::Reserve` calls with
     `perf stat -e mem:<addr>:x -p <pid>`.
